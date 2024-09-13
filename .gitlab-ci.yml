@@ -1,0 +1,78 @@
+stages:
+  - search
+  - fetch-configmap
+  - consolidate-output
+
+variables:
+  INSTANCE_NAME: "virtualmeetingmgmt"  # Replace with the partial instance name
+
+# Step 1: Search for all pods that match the partial instance name
+search_pods:
+  stage: search
+  script:
+    - |
+      echo "Searching for pods matching $INSTANCE_NAME in cache-test namespace"
+      kubectl get pods -n cache-test | grep $INSTANCE_NAME > found_pods.txt
+      if [[ -s found_pods.txt ]]; then
+        echo "Pods matching $INSTANCE_NAME found:"
+        cat found_pods.txt
+      else
+        echo "No pods matching $INSTANCE_NAME found"
+      fi
+  tags:
+    - cache-utility-test  # Use the runner associated with cache-test
+  artifacts:
+    paths:
+      - found_pods.txt
+    when: always
+
+# Step 2: Fetch the ConfigMap and extract the redis.conf section
+fetch_configmap:
+  stage: fetch-configmap
+  needs:
+    - search_pods
+  script:
+    - |
+      echo "Fetching ConfigMap for $INSTANCE_NAME"
+      CONFIGMAP_NAME=$(kubectl get configmaps -n cache-test | grep "$INSTANCE_NAME-redis-ha-configmap" | awk '{print $1}')
+      
+      if [[ ! -z "$CONFIGMAP_NAME" ]]; then
+        echo "Found ConfigMap: $CONFIGMAP_NAME"
+        kubectl get configmap $CONFIGMAP_NAME -n cache-test -o jsonpath="{.data.redis\.conf}" > redis_conf_output.txt
+        echo "Extracting maxmemory from redis.conf:"
+        cat redis_conf_output.txt | grep -A 10 'redis.conf' | grep 'maxmemory' > maxmemory_output.txt
+      else
+        echo "No ConfigMap found for $INSTANCE_NAME"
+      fi
+  tags:
+    - cache-utility-test
+  artifacts:
+    paths:
+      - redis_conf_output.txt
+      - maxmemory_output.txt
+    when: always
+
+# Step 3: Consolidate the output and print the results
+consolidate_output:
+  stage: consolidate-output
+  needs:
+    - fetch_configmap
+  script:
+    - |
+      echo "Consolidating the output"
+      echo "Pods and ConfigMap information for $INSTANCE_NAME:" > final_report.txt
+      if [[ -s found_pods.txt ]]; then
+        cat found_pods.txt >> final_report.txt
+      else
+        echo "No matching pods found" >> final_report.txt
+      fi
+      echo "---- Redis Config (redis.conf) ----" >> final_report.txt
+      cat redis_conf_output.txt >> final_report.txt
+      echo "---- maxmemory ----" >> final_report.txt
+      cat maxmemory_output.txt >> final_report.txt
+  tags:
+    - general-runner
+  artifacts:
+    paths:
+      - final_report.txt
+    when: always
