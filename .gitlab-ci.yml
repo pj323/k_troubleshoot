@@ -44,9 +44,9 @@ fetch_configmap:
       
       if [[ ! -z "$CONFIGMAP_NAME" ]]; then
         echo "Found ConfigMap: $CONFIGMAP_NAME"
-        kubectl get configmap $CONFIGMAP_NAME -n cache-test -o jsonpath="{.data.redis\.conf}" > redis_conf_output.txt
-        echo "Extracting maxmemory from redis.conf:"
-        cat redis_conf_output.txt | grep -A 10 'redis.conf' | grep 'maxmemory' > maxmemory_output.txt
+        # Fetch the entire ConfigMap and extract the redis.conf section until 'logfile'
+        kubectl get configmap $CONFIGMAP_NAME -n cache-test -o yaml > full_configmap_output.yaml
+        cat full_configmap_output.yaml | sed -n '/redis\.conf:/,/logfile/p' > redis_conf_output.txt
       else
         echo "No ConfigMap found for $INSTANCE_NAME"
       fi
