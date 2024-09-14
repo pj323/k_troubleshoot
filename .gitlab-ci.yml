@@ -5,9 +5,12 @@ stages:
 
 variables:
   INSTANCE_NAME: "virtualmeetingmgmt"  # Replace with the partial instance name
+  KUBECTL: "bitnami/kubectl:latest"    # Docker image for running kubectl commands
+  CENTOS: "centos:7"                   # Docker image for general-purpose tasks
 
 # Step 1: Search for all pods that match the partial instance name
 search_pods:
+  image: $KUBECTL
   stage: search
   script:
     - |
@@ -25,9 +28,12 @@ search_pods:
     paths:
       - found_pods.txt
     when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
 
 # Step 2: Fetch the ConfigMap and extract the redis.conf section
 fetch_configmap:
+  image: $KUBECTL
   stage: fetch-configmap
   needs:
     - search_pods
@@ -51,9 +57,12 @@ fetch_configmap:
       - redis_conf_output.txt
       - maxmemory_output.txt
     when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
 
 # Step 3: Consolidate the output and print the results
 consolidate_output:
+  image: $CENTOS
   stage: consolidate-output
   needs:
     - fetch_configmap
@@ -76,3 +85,5 @@ consolidate_output:
     paths:
       - final_report.txt
     when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
