@@ -1,12 +1,15 @@
 stages:
   - search
   - fetch-configmap
+  - fetch-sts
   - consolidate-output
 
 variables:
   INSTANCE_NAME: "virtualmeetingmgmt"  # Replace with the partial instance name
-  KUBECTL: "bitnami/kubectl:latest"    # Docker image for running kubectl commands
-  CENTOS: "centos:7"                   # Docker image for general-purpose tasks
+  STS_NAME: "virtualmgmt-test-redis-ha-server"  # Replace with actual StatefulSet name
+  NAMESPACE: "cache-test"
+  KUBECTL: "bitnami/kubectl:latest"
+  CENTOS: "centos:7"
 
 # Step 1: Search for all pods that match the partial instance name
 search_pods:
@@ -14,8 +17,8 @@ search_pods:
   stage: search
   script:
     - |
-      echo "Searching for pods matching $INSTANCE_NAME in cache-test namespace"
-      kubectl get pods -n cache-test | grep $INSTANCE_NAME > found_pods.txt
+      echo "Searching for pods matching $INSTANCE_NAME in $NAMESPACE namespace"
+      kubectl get pods -n $NAMESPACE | grep $INSTANCE_NAME > found_pods.txt
       if [[ -s found_pods.txt ]]; then
         echo "Pods matching $INSTANCE_NAME found:"
         cat found_pods.txt
@@ -23,7 +26,7 @@ search_pods:
         echo "No pods matching $INSTANCE_NAME found"
       fi
   tags:
-    - cache-utility-test  # Use the runner associated with cache-test
+    - cache-utility-test
   artifacts:
     paths:
       - found_pods.txt
@@ -40,13 +43,13 @@ fetch_configmap:
   script:
     - |
       echo "Fetching ConfigMap for $INSTANCE_NAME"
-      CONFIGMAP_NAME=$(kubectl get configmaps -n cache-test | grep "$INSTANCE_NAME-redis-ha-configmap" | awk '{print $1}')
+      CONFIGMAP_NAME=$(kubectl get configmaps -n $NAMESPACE | grep "$INSTANCE_NAME-redis-ha-configmap" | awk '{print $1}')
       
       if [[ ! -z "$CONFIGMAP_NAME" ]]; then
         echo "Found ConfigMap: $CONFIGMAP_NAME"
         # Fetch the entire ConfigMap and extract the redis.conf section until 'logfile'
-        kubectl get configmap $CONFIGMAP_NAME -n cache-test -o yaml > full_configmap_output.yaml
-        cat full_configmap_output.yaml | sed -n '/redis\.conf:/,/logfile/p' > redis_conf_output.txt
+        kubectl get configmap $CONFIGMAP_NAME -n $NAMESPACE -o yaml > full_configmap_output.yaml
+        cat full_configmap_output.yaml | sed -n '/redis\.conf: |/,/logfile/p' > redis_conf_output.txt
       else
         echo "No ConfigMap found for $INSTANCE_NAME"
       fi
@@ -55,17 +58,39 @@ fetch_configmap:
   artifacts:
     paths:
       - redis_conf_output.txt
-      - maxmemory_output.txt
     when: always
   rules:
     - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
 
-# Step 3: Consolidate the output and print the results
+# Step 3: Fetch StatefulSet (STS) details, parse container information, and extract resource limits
+fetch_sts:
+  image: $KUBECTL
+  stage: fetch-sts
+  needs:
+    - fetch_configmap
+  script:
+    - |
+      echo "Fetching StatefulSet details for $STS_NAME"
+      kubectl get sts $STS_NAME -n $NAMESPACE -o json > sts_output.json
+
+      # Parsing the container details using jq
+      echo "Parsing the StatefulSet container details"
+      jq '.spec.template.spec.containers[] | {name: .name, image: .image, resources: .resources}' sts_output.json > parsed_sts_output.json
+  tags:
+    - cache-utility-test
+  artifacts:
+    paths:
+      - parsed_sts_output.json
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
+# Step 4: Consolidate the output and print the results
 consolidate_output:
   image: $CENTOS
   stage: consolidate-output
   needs:
-    - fetch_configmap
+    - fetch_sts
   script:
     - |
       echo "Consolidating the output"
@@ -75,10 +100,12 @@ consolidate_output:
       else
         echo "No matching pods found" >> final_report.txt
       fi
+
       echo "---- Redis Config (redis.conf) ----" >> final_report.txt
       cat redis_conf_output.txt >> final_report.txt
-      echo "---- maxmemory ----" >> final_report.txt
-      cat maxmemory_output.txt >> final_report.txt
+
+      echo "---- StatefulSet (STS) Container Details ----" >> final_report.txt
+      cat parsed_sts_output.json >> final_report.txt
   tags:
     - general-runner
   artifacts:
