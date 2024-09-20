@@ -114,3 +114,167 @@ consolidate_output:
     when: always
   rules:
     - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
+
+
+
+
+    stages:
+  - search
+  - fetch-configmap
+  - fetch-sts
+  - fetch-logs
+  - consolidate-output
+
+variables:
+  INSTANCE_NAME: "underwriting"  # Replace with the actual instance name
+  NAMESPACE: "cache-test"
+  KUBECTL: "bitnami/kubectl:latest"
+  CENTOS: "centos:7"
+  STS_NAME: "underwriting-test-redis-ha-server"  # Replace with the actual StatefulSet name
+
+# Step 1: Search for all pods that match the instance name, but fetch only the last 3 with 'server-0', 'server-1', 'server-2'
+search_pods:
+  image: $KUBECTL
+  stage: search
+  script:
+    - |
+      echo "Searching for pods matching $INSTANCE_NAME in $NAMESPACE namespace"
+      # Fetch the list of pods, filter the ones that end with server-0, server-1, and server-2, and pick the last 3
+      kubectl get pods -n $NAMESPACE --sort-by=.metadata.creationTimestamp | grep $INSTANCE_NAME | grep -E 'server-0|server-1|server-2' | tail -n 3 > found_pods.txt
+
+      # Check if any pods were found
+      if [[ -s found_pods.txt ]]; then
+        echo "Pods matching $INSTANCE_NAME found (server-0, server-1, server-2):"
+        cat found_pods.txt
+      else
+        echo "No pods matching $INSTANCE_NAME found"
+      fi
+  tags:
+    - cache-utility-test
+  artifacts:
+    paths:
+      - found_pods.txt
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
+# Step 2: Fetch the ConfigMap and extract the redis.conf section
+fetch_configmap:
+  image: $KUBECTL
+  stage: fetch-configmap
+  needs:
+    - search_pods
+  script:
+    - |
+      echo "Fetching ConfigMap for $INSTANCE_NAME"
+      CONFIGMAP_NAME=$(kubectl get configmaps -n $NAMESPACE | grep "$INSTANCE_NAME-redis-ha-configmap" | awk '{print $1}')
+      
+      if [[ ! -z "$CONFIGMAP_NAME" ]]; then
+        echo "Found ConfigMap: $CONFIGMAP_NAME"
+        # Fetch the entire ConfigMap and extract the redis.conf section until 'logfile'
+        kubectl get configmap $CONFIGMAP_NAME -n $NAMESPACE -o yaml > full_configmap_output.yaml
+        cat full_configmap_output.yaml | sed -n '/redis\.conf: |/,/logfile/p' > redis_conf_output.txt
+      else
+        echo "No ConfigMap found for $INSTANCE_NAME"
+      fi
+  tags:
+    - cache-utility-test
+  artifacts:
+    paths:
+      - redis_conf_output.txt
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
+# Step 3: Fetch StatefulSet (STS) details, parse container information, and extract resource limits
+fetch_sts:
+  image: $KUBECTL
+  stage: fetch-sts
+  needs:
+    - fetch_configmap
+  script:
+    - |
+      echo "Fetching StatefulSet details for $STS_NAME"
+      kubectl get sts $STS_NAME -n $NAMESPACE -o json > sts_output.json
+
+      # Parsing the container details using jq
+      echo "Parsing the StatefulSet container details"
+      jq '.spec.template.spec.containers[] | {name: .name, image: .image, resources: .resources}' sts_output.json > parsed_sts_output.json
+  tags:
+    - cache-utility-test
+  artifacts:
+    paths:
+      - parsed_sts_output.json
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
+# Step 4: Fetch Redis logs for the last 3 pods (server-0, server-1, server-2)
+fetch_logs:
+  image: $KUBECTL
+  stage: fetch-logs
+  needs:
+    - fetch_sts
+  script:
+    - |
+      echo "Fetching Redis logs for the last 3 pods"
+      while read pod_name; do
+        echo "Processing pod $pod_name"
+        # Step 1: Execute inside the pod to fetch redis-server.log
+        kubectl exec -n $NAMESPACE $pod_name -- sh -c 'cd ../redis_data && tail -n 500 redis-server.log' > ${pod_name}_redis.log || echo "No Redis logs found for $pod_name"
+        
+        # Step 2: Fetch recent logs from the Redis container
+        kubectl logs $pod_name -n $NAMESPACE -c redis > ${pod_name}_recent.log || echo "No recent logs found for $pod_name"
+      done < found_pods.txt
+  tags:
+    - cache-utility-test
+  artifacts:
+    paths:
+      - *_redis.log
+      - *_recent.log
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
+# Step 5: Consolidate the output and print the results
+consolidate_output:
+  image: $CENTOS
+  stage: consolidate-output
+  needs:
+    - fetch_logs
+  script:
+    - |
+      echo "Consolidating the output"
+      echo "Pods, ConfigMap, and Redis Logs for $INSTANCE_NAME:" > final_report.txt
+
+      # Adding found pod information
+      if [[ -s found_pods.txt ]]; then
+        echo "Processing logs for found pods..." >> final_report.txt
+        while read pod_name; do
+          echo "---- Logs for Pod $pod_name ----" >> final_report.txt
+          echo "---- Redis Log (redis-server.log) ----" >> final_report.txt
+          cat ${pod_name}_redis.log >> final_report.txt
+          echo "---- Recent Logs ----" >> final_report.txt
+          cat ${pod_name}_recent.log >> final_report.txt
+        done < found_pods.txt
+      else
+        echo "No matching pods found" >> final_report.txt
+      fi
+
+      # Adding ConfigMap information
+      echo "---- Redis Config (redis.conf) ----" >> final_report.txt
+      cat redis_conf_output.txt >> final_report.txt
+
+      # Adding StatefulSet information
+      echo "---- StatefulSet (STS) Container Details ----" >> final_report.txt
+      cat parsed_sts_output.json >> final_report.txt
+  tags:
+    - general-runner
+  artifacts:
+    paths:
+      - final_report.txt
+    when: always
+  rules:
+    - if: '$CI_PIPELINE_SOURCE != "push" && $CI_PIPELINE_SOURCE != "merge_request_event"'
+
